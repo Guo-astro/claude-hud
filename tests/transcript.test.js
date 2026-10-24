@@ -1,4 +1,6 @@
 import { test } from 'node:test';
+import { spawnSync } from 'node:child_process';
+import { stripVTControlCharacters } from 'node:util';
 import assert from 'node:assert/strict';
 import { appendFile, mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -293,6 +295,181 @@ test('TaskCreate ids survive TodoWrite rewrites, including duplicate content', a
     ['Ship', 'completed'],
   ]);
   assert.equal(r.tools.length, 0, 'task tools are not activity');
+});
+
+test('numeric task IDs survive deletion and TodoWrite, including after a saved cursor', async () => {
+  const created = ['First task', 'Same subject', 'Same subject'].map((subject, i) =>
+    toolUse('create-' + i, 'TaskCreate', { subject }));
+  for (const deleted of [[0], [1], [2], [0, 1], [0, 2], [1, 2], [0, 1, 2]]) {
+    const removals = deleted.map((i) =>
+      toolUse('delete-' + i, 'TaskUpdate', { taskId: String(i + 1), status: 'deleted' }));
+    const rewrite = toolUse('rewrite', 'TodoWrite', { todos: created.flatMap((entry, i) => deleted.includes(i) ? [] : [{
+      content: entry.message.content[0].input.subject, status: 'pending',
+    }]) });
+    const updates = [
+      ...removals, // Repeating a deletion must not remove a different task.
+      ...created.map((_, i) =>
+        toolUse('update-' + i, 'TaskUpdate', { taskId: String(i + 1), status: 'completed' })),
+      toolUse('missing', 'TaskUpdate', { taskId: '99', status: 'deleted' }),
+      toolUse('create-new', 'TaskCreate', { subject: 'New task' }),
+      toolUse('finish-new', 'TaskUpdate', { taskId: '4', status: 'completed' }),
+    ];
+    const expected = created.flatMap((entry, i) => deleted.includes(i) ? [] : [{
+      content: entry.message.content[0].input.subject, status: 'completed',
+    }]).concat({ content: 'New task', status: 'completed' });
+    assert.deepEqual((await parse([...created, ...removals, rewrite, ...updates])).todos, expected, 'full read');
+
+    const dir = await mkdtemp(path.join(tmpdir(), 'hud-task-delete-'));
+    try {
+      const file = path.join(dir, 'transcript.jsonl');
+      const jsonl = (entries) => entries.map((entry) => JSON.stringify(entry) + '\n').join('');
+      await writeFile(file, jsonl(created));
+      await parseTranscript(file, dir);
+      await appendFile(file, jsonl(removals));
+      assert.equal((await parseTranscript(file, dir)).todos.length, 3 - deleted.length, 'resumed deletion');
+      await appendFile(file, jsonl([rewrite]));
+      await parseTranscript(file, dir);
+      await appendFile(file, jsonl(updates));
+      assert.deepEqual((await parseTranscript(file, dir)).todos, expected, 'resumed updates');
+      assert.deepEqual((await parseTranscript(file, dir)).todos, expected, 'saved deletion state');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('numeric task IDs follow their task through a TodoWrite reorder without any deletion', async () => {
+  const r = await parse([
+    toolUse('c1', 'TaskCreate', { subject: 'A' }),
+    toolUse('c2', 'TaskCreate', { subject: 'B' }),
+    toolUse('c3', 'TaskCreate', { subject: 'C' }),
+    toolUse('reorder', 'TodoWrite', { todos: [
+      { content: 'B', status: 'pending' }, { content: 'A', status: 'pending' }, { content: 'C', status: 'pending' },
+    ] }),
+    toolUse('a', 'TaskUpdate', { taskId: '1', status: 'completed' }),
+  ]);
+  assert.deepEqual(r.todos, [
+    { content: 'B', status: 'pending' }, { content: 'A', status: 'completed' }, { content: 'C', status: 'pending' },
+  ]);
+});
+
+test('numeric task IDs follow reordered tasks and are not reused after clearing todos', async () => {
+  const first = [
+    toolUse('c1', 'TaskCreate', { subject: 'Discarded' }),
+    toolUse('c2', 'TaskCreate', { subject: 'Ship' }),
+    toolUse('c3', 'TaskCreate', { subject: 'Docs' }),
+    toolUse('delete', 'TaskUpdate', { taskId: '1', status: 'deleted' }),
+    toolUse('reorder', 'TodoWrite', { todos: [
+      { content: 'Docs', status: 'pending' }, { content: 'Ship', status: 'pending' },
+    ] }),
+    toolUse('docs', 'TaskUpdate', { taskId: '3', status: 'in_progress' }),
+    toolUse('ship', 'TaskUpdate', { taskId: '2', status: 'completed' }),
+    toolUse('retired', 'TaskUpdate', { taskId: '1', status: 'completed', subject: 'Wrong' }),
+  ];
+  assert.deepEqual((await parse(first)).todos, [
+    { content: 'Docs', status: 'in_progress' }, { content: 'Ship', status: 'completed' },
+  ]);
+  const second = [
+    ...first,
+    toolUse('delete-ship', 'TaskUpdate', { taskId: '2', status: 'deleted' }),
+    toolUse('rewrite', 'TodoWrite', { todos: [{ content: 'Docs', status: 'in_progress' }] }),
+    toolUse('repeat-delete', 'TaskUpdate', { taskId: '2', status: 'deleted' }),
+    toolUse('c4', 'TaskCreate', { subject: 'New' }),
+    toolUse('new', 'TaskUpdate', { taskId: '4', status: 'completed' }),
+  ];
+  assert.deepEqual((await parse(second)).todos, [
+    { content: 'Docs', status: 'in_progress' }, { content: 'New', status: 'completed' },
+  ]);
+  const last = [
+    ...second, toolUse('clear', 'TodoWrite', { todos: [] }),
+    ...[1, 2, 3, 4].map((taskId) => toolUse('stale-' + taskId, 'TaskUpdate', { taskId, status: 'completed' })),
+    toolUse('c5', 'TaskCreate', { subject: 'Next' }),
+    toolUse('next', 'TaskUpdate', { taskId: '5', status: 'completed' }),
+  ];
+  assert.deepEqual((await parse(last)).todos, [{ content: 'Next', status: 'completed' }]);
+  const dir = await mkdtemp(path.join(tmpdir(), 'hud-task-reorder-'));
+  try {
+    const file = path.join(dir, 'transcript.jsonl');
+    await writeFile(file, '');
+    let seen = 0;
+    for (const entries of [first, second, last]) {
+      await appendFile(file, entries.slice(seen).map((entry) => JSON.stringify(entry) + '\n').join(''));
+      const expected = (await parse(entries)).todos;
+      assert.deepEqual((await parseTranscript(file, dir)).todos, expected, 'resumed reordering');
+      assert.deepEqual((await parseTranscript(file, dir)).todos, expected, 'saved reordering');
+      seen = entries.length;
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('deleting a named task keeps duplicate-content TaskCreate IDs through TodoWrite', async () => {
+  const deleted = [
+    toolUse('c1', 'TaskCreate', { taskId: 'a', subject: 'Ship' }),
+    toolUse('c2', 'TaskCreate', { taskId: 'b', subject: 'Ship' }),
+    toolUse('c3', 'TaskCreate', { taskId: 'c', subject: 'Write docs' }),
+    toolUse('delete', 'TaskUpdate', { taskId: 'b', status: 'deleted', subject: 'Removed' }),
+  ];
+  assert.deepEqual((await parse(deleted)).todos, [
+    { content: 'Ship', status: 'pending' },
+    { content: 'Write docs', status: 'pending' },
+  ]);
+  const r = await parse([
+    ...deleted,
+    toolUse('rewrite', 'TodoWrite', { todos: [
+      { content: 'Write docs', status: 'pending' },
+      { content: 'Ship', status: 'pending' },
+    ] }),
+    toolUse('stale', 'TaskUpdate', { taskId: 'b', status: 'completed', subject: 'Wrong task' }),
+    toolUse('docs', 'TaskUpdate', { taskId: 'c', status: 'running' }),
+    toolUse('ship', 'TaskUpdate', { taskId: 'a', status: 'completed' }),
+  ]);
+  assert.deepEqual(r.todos, [
+    { content: 'Write docs', status: 'in_progress' },
+    { content: 'Ship', status: 'completed' },
+  ]);
+});
+
+test('the CLI drops deleted tasks from progress and hides an empty task list', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'hud-task-delete-cli-'));
+  try {
+    const configDir = path.join(dir, 'plugins', 'claude-hud');
+    await mkdir(configDir, { recursive: true });
+    await writeFile(path.join(configDir, 'config.json'), JSON.stringify({
+      gitStatus: { enabled: false }, display: { showTodos: true },
+    }));
+    const file = path.join(dir, 'transcript.jsonl');
+    const jsonl = (entries) => entries.map((entry) => JSON.stringify(entry) + '\n').join('');
+    await writeFile(file, jsonl([
+      toolUse('c1', 'TaskCreate', { subject: 'Discarded draft' }),
+      toolUse('c2', 'TaskCreate', { subject: 'Ship fix' }),
+      toolUse('c3', 'TaskCreate', { subject: 'Verify tests' }),
+      toolUse('u0', 'TaskUpdate', { taskId: '2', status: 'in_progress' }),
+      toolUse('u1', 'TaskUpdate', { taskId: '3', status: 'completed' }),
+      toolUse('u2', 'TaskUpdate', { taskId: '1', status: 'deleted' }),
+    ]));
+    const render = () => {
+      const result = spawnSync(process.execPath, [fixture('../dist/index.js')], {
+        cwd: dir,
+        env: { ...process.env, CLAUDE_CONFIG_DIR: dir },
+        input: JSON.stringify({ transcript_path: file, cwd: dir }),
+        encoding: 'utf8',
+      });
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, 0, result.stderr);
+      return stripVTControlCharacters(result.stdout);
+    };
+    assert.match(render(), /Ship fix \(1\/2\)/, 'fresh CLI process');
+    assert.match(render(), /Ship fix \(1\/2\)/, 'CLI process resuming the saved cursor');
+    await appendFile(file, jsonl([
+      toolUse('u3', 'TaskUpdate', { taskId: '2', status: 'deleted' }),
+      toolUse('u4', 'TaskUpdate', { taskId: '3', status: 'deleted' }),
+    ]));
+    assert.doesNotMatch(render(), /Ship fix|Discarded draft|Verify tests|todos complete/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('MCP errors follow each server\'s latest result and are sanitized and bounded', async () => {
